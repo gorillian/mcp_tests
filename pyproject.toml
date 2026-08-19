@@ -7,5 +7,6 @@ requires-python = ">=3.14"
 dependencies = [
     "httpx>=0.28.1",
     "mcp[cli]>=1.28.1",
+    "pinecone>=9.1.0",
     "python-dotenv>=1.2.2",
 ]

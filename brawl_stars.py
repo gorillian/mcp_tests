@@ -8,6 +8,7 @@ from typing import Any
 
 import httpx
 from mcp.server.fastmcp import FastMCP
+from pinecone import Pinecone
 
 API_BASE = "https://api.brawlstars.com/v1"
 MY_PLAYER_TAG = "#QLYP829J"
@@ -293,6 +294,129 @@ async def get_winrates(player_tag: str) -> str:
     )
 
 
+def _env(name: str) -> str:
+    return (os.environ.get(name) or "").strip().strip('"').strip("'")
+
+
+def _parse_winrates_md(path: Path) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    if not path.exists():
+        return rows
+    for line in path.read_text(encoding="utf-8").splitlines():
+        match = re.match(
+            r"\|\s*([^|]+?)\s*\|\s*(\d+)\s*\|\s*(\d+)\s*\|\s*(\d+(?:\.\d+)?)%\s*\|",
+            line,
+        )
+        if not match:
+            continue
+        name = match.group(1).strip()
+        if name.lower() in {"brawler"} or set(name) <= {"-", ":"}:
+            continue
+        rows.append(
+            {
+                "name": name,
+                "games": int(match.group(2)),
+                "wins": int(match.group(3)),
+                "win_rate": float(match.group(4)),
+            }
+        )
+    return rows
+
+
+def _parse_meta_text(text: str) -> dict[str, dict[str, Any]]:
+    # Stored as: "Rico 52.5%/3.19%/8.9, Edgar 52.5%/2.62%/8.8"
+    pattern = re.compile(
+        r"([A-Za-z0-9][A-Za-z0-9.\- &']*?)\s+"
+        r"(\d+(?:\.\d+)?)%/(\d+(?:\.\d+)?)%/(\d+(?:\.\d+)?)"
+    )
+    parsed: dict[str, dict[str, Any]] = {}
+    for match in pattern.finditer(text or ""):
+        name = match.group(1).strip()
+        parsed[name.casefold()] = {
+            "name": name,
+            "win_rate": float(match.group(2)),
+            "use_rate": float(match.group(3)),
+            "score": float(match.group(4)),
+        }
+    return parsed
+
+
+def _query_meta_stats(brawler_names: list[str]) -> tuple[dict[str, dict[str, Any]], str | None]:
+    api_key = _env("PINECONE_API_KEY")
+    index_name = _env("PINECONE_INDEX_NAME")
+    if not api_key:
+        return {}, "PINECONE_API_KEY is not set. Add it to .env (same key as llm-api-practice)."
+    if not index_name:
+        return {}, "PINECONE_INDEX_NAME is not set. Add it to .env."
+
+    query = "Brawl Stars brawler meta win rates"
+    if brawler_names:
+        query += " " + " ".join(brawler_names)
+
+    try:
+        pc = Pinecone(api_key=api_key)
+        embedding = pc.inference.embed(
+            model="multilingual-e5-large",
+            inputs=[query],
+            parameters={"input_type": "query", "truncate": "END"},
+        )
+        vector = embedding.data[0].values
+        result = pc.Index(index_name).query(
+            vector=vector,
+            top_k=8,
+            include_metadata=True,
+        )
+    except Exception as exc:
+        return {}, f"Failed to query Pinecone: {exc}"
+
+    meta: dict[str, dict[str, Any]] = {}
+    for match in result.matches or []:
+        text = str((match.metadata or {}).get("text") or "")
+        meta.update(_parse_meta_text(text))
+    return meta, None
+
+
+async def compare_stats_to_overall() -> str:
+    """Compare your my-winrates.md stats to Brawler meta stored in Pinecone."""
+    mine = _parse_winrates_md(WINRATES_MD)
+    if not mine:
+        return (
+            f"No personal win rates found in {WINRATES_MD}. "
+            "Run get_winrates with your tag first."
+        )
+
+    meta, error = _query_meta_stats([row["name"] for row in mine])
+    if error:
+        return error
+    if not meta:
+        return "Pinecone returned no parseable brawler meta stats."
+
+    lines = [
+        "Your win rates vs Pinecone meta (source: brawl-stats).",
+        "Meta values are win rate / use rate / score; comparison uses win rate.",
+        "",
+    ]
+    missing: list[str] = []
+    for row in mine:
+        entry = meta.get(row["name"].casefold())
+        if not entry:
+            missing.append(row["name"])
+            continue
+        diff = row["win_rate"] - entry["win_rate"]
+        sign = "+" if diff >= 0 else ""
+        games_label = "game" if row["games"] == 1 else "games"
+        lines.append(
+            f"- {row['name']}: you {row['win_rate']:.0f}% ({row['games']} {games_label}) "
+            f"vs meta {entry['win_rate']:.1f}% ({sign}{diff:.1f})"
+        )
+
+    if missing:
+        lines.append("")
+        lines.append("No meta in Pinecone for: " + ", ".join(missing))
+
+    return "\n".join(lines)
+
+
 async def get_knockout_heist_hotzone() -> str:
     """Get current Knockout map(s) and whether Heist or Hot Zone is in rotation.
 
@@ -374,5 +498,6 @@ async def get_next_expiring_map() -> str:
 
 def register(mcp: FastMCP) -> None:
     mcp.tool()(get_winrates)
+    mcp.tool()(compare_stats_to_overall)
     mcp.tool()(get_knockout_heist_hotzone)
     mcp.tool()(get_next_expiring_map)
