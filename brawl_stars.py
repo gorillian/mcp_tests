@@ -1,14 +1,19 @@
+import json
 import os
 import re
 import urllib.parse
-from collections import Counter
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 import httpx
 from mcp.server.fastmcp import FastMCP
 
 API_BASE = "https://api.brawlstars.com/v1"
+MY_PLAYER_TAG = "#QLYP829J"
+WINRATES_DIR = Path.home() / "Desktop" / "General" / "brawlstars"
+WINRATES_MD = WINRATES_DIR / "my-winrates.md"
+WINRATES_STATE = WINRATES_DIR / ".winrates-state.json"
 
 
 def _normalize_tag(player_tag: str) -> str:
@@ -111,8 +116,121 @@ async def _fetch_event_rotation() -> tuple[list[dict] | None, str | None]:
     return None, "Unexpected event rotation response."
 
 
+def _player_brawler(battle: dict, tag: str) -> str | None:
+    groups = list(battle.get("teams") or [])
+    if battle.get("players"):
+        groups.append(battle["players"])
+    for group in groups:
+        for player in group or []:
+            if (player.get("tag") or "").upper() == tag:
+                return (player.get("brawler") or {}).get("name")
+    return None
+
+
+def _parse_battles(items: list, tag: str) -> list[tuple[str, str, bool]]:
+    battles: list[tuple[str, str, bool]] = []
+    for item in items:
+        battle = item.get("battle") or {}
+        result = battle.get("result")
+        if result not in {"victory", "defeat"}:
+            continue
+        brawler = _player_brawler(battle, tag)
+        if not brawler:
+            continue
+        key = item.get("battleTime") or f"{brawler}|{result}|{len(battles)}"
+        battles.append((str(key), brawler, result == "victory"))
+    return battles
+
+
+def _count_brawlers(battles: list[tuple[str, str, bool]]) -> dict[str, dict[str, int]]:
+    totals: dict[str, dict[str, int]] = {}
+    for _, brawler, won in battles:
+        stats = totals.setdefault(brawler, {"games": 0, "wins": 0})
+        stats["games"] += 1
+        if won:
+            stats["wins"] += 1
+    return totals
+
+
+def _rate_lines(brawlers: dict[str, Any]) -> list[str]:
+    ranked = sorted(
+        brawlers.items(),
+        key=lambda item: (-int(item[1].get("games") or 0), item[0]),
+    )
+    lines: list[str] = []
+    for name, stats in ranked:
+        games = int(stats.get("games") or 0)
+        wins = int(stats.get("wins") or 0)
+        if games:
+            lines.append(f"- {name.title()}: {wins}/{games} ({100.0 * wins / games:.0f}%)")
+    return lines
+
+
+def _load_my_stats() -> dict[str, Any]:
+    empty = {"brawlers": {}, "seen": []}
+    if not WINRATES_STATE.exists():
+        return empty
+    try:
+        data = json.loads(WINRATES_STATE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return empty
+    if not isinstance(data, dict):
+        return empty
+    if "brawlers" in data:
+        return data
+    mine = (data.get("players") or {}).get(MY_PLAYER_TAG)
+    return mine if isinstance(mine, dict) else empty
+
+
+def _save_my_stats(stats: dict[str, Any]) -> None:
+    WINRATES_DIR.mkdir(parents=True, exist_ok=True)
+    WINRATES_STATE.write_text(json.dumps(stats, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    brawlers = stats.get("brawlers") or {}
+    rows = []
+    total_games = total_wins = 0
+    for name, entry in sorted(brawlers.items(), key=lambda item: (-int(item[1].get("games") or 0), item[0])):
+        games = int(entry.get("games") or 0)
+        wins = int(entry.get("wins") or 0)
+        if not games:
+            continue
+        total_games += games
+        total_wins += wins
+        rows.append(f"| {name.title()} | {games} | {wins} | {100.0 * wins / games:.0f}% |")
+
+    now = datetime.now(timezone.utc).strftime("%d %b %Y, %H:%M UTC")
+    overall = f"{100.0 * total_wins / total_games:.0f}%" if total_games else "—"
+    table = (
+        "\n".join(
+            [
+                "| Brawler | Games | Wins | Win Rate |",
+                "|:--------|------:|-----:|---------:|",
+                *rows,
+            ]
+        )
+        if rows
+        else "_No battles tracked yet._"
+    )
+    WINRATES_MD.write_text(
+        "\n".join(
+            [
+                "# My Brawl Stars Win Rates",
+                "",
+                f"**Player:** {MY_PLAYER_TAG}  ",
+                f"**Updated:** {now}  ",
+                f"**Battles:** {total_games} ({total_wins} wins, {overall})",
+                "",
+                table,
+                "",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
 async def get_winrates(player_tag: str) -> str:
-    """Get recent win rates by brawler from a player's battle log.
+    """Get win rates by brawler. Only #QLYP829J is saved to my-winrates.md.
 
     Args:
         player_tag: Brawl Stars player tag, e.g. #QLYP829J
@@ -123,7 +241,7 @@ async def get_winrates(player_tag: str) -> str:
 
     tag = _normalize_tag(player_tag)
     encoded = urllib.parse.quote(tag)
-    url = f"https://api.brawlstars.com/v1/players/{encoded}/battlelog"
+    url = f"{API_BASE}/players/{encoded}/battlelog"
     headers = {"Authorization": f"Bearer {key}", "Accept": "application/json"}
 
     async with httpx.AsyncClient(timeout=30.0) as client:
@@ -134,47 +252,45 @@ async def get_winrates(player_tag: str) -> str:
         except Exception as exc:
             return f"Failed to fetch battle log for {tag}: {exc}"
 
-    wins: Counter[str] = Counter()
-    games: Counter[str] = Counter()
-    decided = 0
+    battles = _parse_battles(data.get("items", []), tag)
+    if tag != MY_PLAYER_TAG:
+        if not battles:
+            return f"No recent decided team battles found for {tag}."
+        return (
+            f"Recent win rates for {tag} ({len(battles)} decided battles). "
+            f"Not saved (only {MY_PLAYER_TAG} is tracked).\n\n"
+            + "\n".join(_rate_lines(_count_brawlers(battles)))
+        )
 
-    for item in data.get("items", []):
-        battle = item.get("battle") or {}
-        result = battle.get("result")  # victory | defeat | draw (team modes)
-        if result not in {"victory", "defeat"}:
+    stats = _load_my_stats()
+    seen = set(stats.get("seen") or [])
+    brawlers: dict[str, Any] = stats.setdefault("brawlers", {})
+    added = 0
+    for key, brawler, won in battles:
+        if key in seen:
             continue
+        seen.add(key)
+        entry = brawlers.setdefault(brawler, {"games": 0, "wins": 0})
+        entry["games"] = int(entry.get("games") or 0) + 1
+        if won:
+            entry["wins"] = int(entry.get("wins") or 0) + 1
+        added += 1
+    stats["seen"] = sorted(seen)
 
-        my_brawler = None
-        for team in battle.get("teams") or []:
-            for player in team:
-                if (player.get("tag") or "").upper() == tag:
-                    my_brawler = (player.get("brawler") or {}).get("name")
-                    break
-            if my_brawler:
-                break
+    try:
+        _save_my_stats(stats)
+    except OSError as exc:
+        return f"Fetched win rates for {tag}, but failed to save {WINRATES_MD}: {exc}"
 
-        if not my_brawler and battle.get("players"):
-            for player in battle["players"]:
-                if (player.get("tag") or "").upper() == tag:
-                    my_brawler = (player.get("brawler") or {}).get("name")
-                    break
-
-        if not my_brawler:
-            continue
-
-        decided += 1
-        games[my_brawler] += 1
-        if result == "victory":
-            wins[my_brawler] += 1
-
-    if not games:
+    if not brawlers:
         return f"No recent decided team battles found for {tag}."
 
-    lines = [f"Recent win rates for {tag} ({decided} decided battles):"]
-    for brawler, count in games.most_common():
-        rate = 100.0 * wins[brawler] / count
-        lines.append(f"- {brawler}: {wins[brawler]}/{count} ({rate:.0f}%)")
-    return "\n".join(lines)
+    total = sum(int(entry.get("games") or 0) for entry in brawlers.values())
+    return (
+        f"Updated ~/Desktop/General/brawlstars/my-winrates.md\n"
+        f"Added {added} new battle{'s' if added != 1 else ''} ({total} total tracked).\n\n"
+        + "\n".join(_rate_lines(brawlers))
+    )
 
 
 async def get_knockout_heist_hotzone() -> str:
